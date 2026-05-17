@@ -9,9 +9,10 @@ class PermissionsService {
       Permission.camera,
       Permission.microphone,
       Permission.locationWhenInUse,
+      Permission.photos,
     ].request();
 
-    return statuses.values.every((s) => s.isGranted);
+    return statuses.values.every((s) => s.isGranted || s.isLimited);
   }
 
   Future<bool> hasAllPermissions() async {

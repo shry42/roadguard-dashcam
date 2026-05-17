@@ -132,8 +132,8 @@
         <button id="disconnectBtn" class="secondary" disabled>Disconnect</button>
       </div>
       <p style="margin-top:12px;font-size:13px;color:#64748b">
-        Multiple browser tabs are supported when the server runs relay mode (see log after Connect).
-        For two windows on one PC without relay, use <strong>Pop-out monitor</strong> after the first tab is live.
+        <strong>Direct mode</strong> (phone → browser): best for pothole / CV scripts — log shows “Got offer from phone”.
+        Relay mode (server re-encode) is off on Render by default. Use one watch tab; for a second window use <strong>Pop-out monitor</strong>.
       </p>
     </div>
 
@@ -333,6 +333,9 @@
           if (msg.relayMode) {
             serverRelayMode = true;
             log('Server relay ON — multiple tabs supported');
+          } else {
+            serverRelayMode = false;
+            log('Direct stream — phone → browser (best for pothole detection)');
           }
           if (msg.viewerId) {
             myViewerId = msg.viewerId;

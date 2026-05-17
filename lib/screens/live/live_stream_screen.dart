@@ -1,10 +1,12 @@
 import 'dart:async';
+import 'dart:io';
 
 import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 import '../../core/theme/app_colors.dart';
 import '../../services/dashcam_service.dart';
+import '../../services/gallery_save_service.dart';
 import '../../services/location_service.dart';
 import '../../services/permissions_service.dart';
 import '../../services/webrtc_stream_service.dart';
@@ -98,18 +100,31 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> with WidgetsBinding
         _ => ResolutionPreset.high,
       };
 
+  bool get _isRecording => _dashcam.isRecording || _stream.isRecording;
+
+  Duration get _recordDuration =>
+      _stream.isRecording ? _stream.recordDuration : _dashcam.recordDuration;
+
+  String get _recordDurationLabel =>
+      _stream.isRecording ? _stream.formatDuration(_recordDuration) : _dashcam.formatDuration(_recordDuration);
+
   Future<void> _toggleRecording() async {
-    if (_stream.isLive) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Stop streaming before local recording')),
-      );
-      return;
-    }
-    if (_dashcam.isRecording) {
-      final file = await _dashcam.stopRecording();
+    if (_isRecording) {
+      final file = _stream.isRecording ? await _stream.stopRecording() : await _dashcam.stopRecording();
       if (file != null && mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Saved: ${file.path.split('/').last}')),
+          SnackBar(content: Text('Saved clip: ${file.path.split('/').last}')),
+        );
+        await _promptSaveToGallery(file, isVideo: true);
+      }
+      return;
+    }
+
+    if (_stream.isLive) {
+      final ok = await _stream.startRecording();
+      if (!ok && mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text(_stream.errorMessage ?? 'Could not start recording while streaming')),
         );
       }
     } else {
@@ -117,8 +132,74 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> with WidgetsBinding
     }
   }
 
+  Future<void> _takeSnapshot() async {
+    final file = _stream.isLive ? await _stream.takeSnapshot() : await _dashcam.takeSnapshot();
+    if (!mounted) return;
+    if (file == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Could not capture snapshot')),
+      );
+      return;
+    }
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('Snapshot saved')),
+    );
+    await _promptSaveToGallery(file, isVideo: false);
+  }
+
+  Future<void> _promptSaveToGallery(File file, {required bool isVideo}) async {
+    if (!mounted) return;
+    final save = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text(isVideo ? 'Save video to gallery?' : 'Save photo to gallery?'),
+        content: Text(
+          isVideo
+              ? 'Your recording is saved in the app. Also add it to your device Photos gallery?'
+              : 'Your snapshot is saved in the app. Also add it to your device Photos gallery?',
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Not now')),
+          FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Save to gallery')),
+        ],
+      ),
+    );
+    if (save != true || !mounted) return;
+
+    final gallery = GallerySaveService.instance;
+    final ok = isVideo ? await gallery.saveVideo(file) : await gallery.saveImage(file);
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(ok ? 'Saved to gallery' : 'Gallery permission denied or save failed'),
+      ),
+    );
+  }
+
+  Future<void> _toggleTorch() async {
+    if (_stream.isLive) {
+      await _stream.toggleTorch();
+      if (mounted) setState(() {});
+      return;
+    }
+    final c = _dashcam.controller;
+    if (c != null && c.value.isInitialized) {
+      await c.setFlashMode(c.value.flashMode == FlashMode.torch ? FlashMode.off : FlashMode.torch);
+      if (mounted) setState(() {});
+    }
+  }
+
   Future<void> _toggleStream() async {
     if (_isStreaming || _stream.isLive || _stream.isConnecting) {
+      if (_stream.isRecording) {
+        final file = await _stream.stopRecording();
+        if (file != null && mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text('Saved clip: ${file.path.split('/').last}')),
+          );
+          await _promptSaveToGallery(file, isVideo: true);
+        }
+      }
       await _stream.stop(); // also re-inits dashcam camera in background
       if (mounted) setState(() => _isStreaming = false);
       return;
@@ -171,7 +252,7 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> with WidgetsBinding
         _buildPreview(),
         _buildTopBar(),
         _buildBottomControls(),
-        if (_dashcam.isRecording) _buildRecordingIndicator(),
+        if (_isRecording) _buildRecordingIndicator(),
         if (_stream.isConnecting) _buildConnectingOverlay(),
         if (_stream.isSwitchingCamera) _buildSwitchingOverlay(),
       ],
@@ -309,9 +390,17 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> with WidgetsBinding
               const Icon(Icons.fiber_manual_record, size: 10, color: Colors.white),
               const SizedBox(width: 8),
               Text(
-                'REC  ${_dashcam.formatDuration(_dashcam.recordDuration)}',
+                'REC  $_recordDurationLabel',
                 style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w700, letterSpacing: 0.5),
               ),
+              if (_stream.isLive && _stream.isRecording)
+                const Padding(
+                  padding: EdgeInsets.only(left: 8),
+                  child: Text(
+                    '+ LIVE',
+                    style: TextStyle(fontSize: 10, fontWeight: FontWeight.w600),
+                  ),
+                ),
             ],
           ),
         ),
@@ -406,10 +495,10 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> with WidgetsBinding
                     decoration: BoxDecoration(
                       shape: BoxShape.circle,
                       border: Border.all(color: Colors.white, width: 4),
-                      color: _dashcam.isRecording ? AppColors.recordRed : Colors.white24,
+                      color: _isRecording ? AppColors.recordRed : Colors.white24,
                     ),
                     child: Icon(
-                      _dashcam.isRecording ? Icons.stop_rounded : Icons.fiber_manual_record,
+                      _isRecording ? Icons.stop_rounded : Icons.fiber_manual_record,
                       color: Colors.white,
                       size: 32,
                     ),
@@ -430,25 +519,12 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> with WidgetsBinding
                 _ControlBtn(
                   icon: Icons.photo_camera_rounded,
                   label: 'Snap',
-                  onTap: () async {
-                    final f = await _dashcam.takeSnapshot();
-                    if (f != null && mounted) {
-                      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Snapshot saved')));
-                    }
-                  },
+                  onTap: _takeSnapshot,
                 ),
                 _ControlBtn(
-                  icon: Icons.wb_sunny_outlined,
+                  icon: _stream.isLive && _stream.torchOn ? Icons.flash_on : Icons.wb_sunny_outlined,
                   label: 'Torch',
-                  onTap: () async {
-                    final c = _dashcam.controller;
-                    if (c != null && c.value.isInitialized) {
-                      await c.setFlashMode(
-                        c.value.flashMode == FlashMode.torch ? FlashMode.off : FlashMode.torch,
-                      );
-                      setState(() {});
-                    }
-                  },
+                  onTap: _toggleTorch,
                 ),
                 if (streaming)
                   _ControlBtn(icon: Icons.sensors, label: 'Live', highlight: true, onTap: () {})

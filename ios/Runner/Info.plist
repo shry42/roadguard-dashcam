@@ -53,6 +53,10 @@
 	<string>RoadGuard needs microphone access to record audio with video.</string>
 	<key>NSLocationWhenInUseUsageDescription</key>
 	<string>RoadGuard uses your location to tag trips and live stream position.</string>
+	<key>NSPhotoLibraryAddUsageDescription</key>
+	<string>RoadGuard saves dashcam recordings and snapshots to your photo library.</string>
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>RoadGuard needs access to save recordings and snapshots to your gallery.</string>
 	<key>UIApplicationSupportsIndirectInputEvents</key>
 	<true/>
 	<key>UILaunchStoryboardName</key>

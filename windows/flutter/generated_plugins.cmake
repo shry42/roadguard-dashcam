@@ -4,6 +4,7 @@
 
 list(APPEND FLUTTER_PLUGIN_LIST
   flutter_webrtc
+  gal
   geolocator_windows
   permission_handler_windows
 )

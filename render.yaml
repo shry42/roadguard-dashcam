@@ -11,3 +11,6 @@ services:
     envVars:
       - key: NODE_ENV
         value: production
+      # Direct phone → browser (better for CV / pothole detection). Same stable Render URL.
+      - key: DISABLE_RELAY
+        value: "1"

@@ -1,12 +1,15 @@
 import 'dart:async';
 import 'dart:convert';
-
+import 'dart:io';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
+import 'package:path/path.dart' as p;
+import 'package:wakelock_plus/wakelock_plus.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 
 import 'app_settings.dart';
 import 'dashcam_service.dart';
+import 'recordings_repository.dart';
 import 'stream_config_service.dart';
 
 enum StreamState { off, connecting, live, error }
@@ -19,8 +22,14 @@ class WebRTCStreamService extends ChangeNotifier {
   String? errorMessage;
   int viewerCount = 0;
   bool isSwitchingCamera = false;
+  bool isRecording = false;
+  Duration recordDuration = Duration.zero;
+  bool torchOn = false;
 
   MediaStream? _localStream;
+  MediaRecorder? _mediaRecorder;
+  String? _recordingPath;
+  Timer? _recordTimer;
   final Map<String, RTCPeerConnection> _viewerPeers = {};
   /// Fallback for older signaling servers that use [start-offer] instead of [viewer-joined].
   RTCPeerConnection? _legacyPeer;
@@ -45,6 +54,108 @@ class WebRTCStreamService extends ChangeNotifier {
 
   bool get isLive => streamState == StreamState.live;
   bool get isConnecting => streamState == StreamState.connecting;
+
+  String formatDuration(Duration d) => DashcamService.instance.formatDuration(d);
+
+  Future<bool> startRecording() async {
+    if (!isLive || isRecording || _localStream == null) return false;
+    final videoTrack = _videoTrack;
+    if (videoTrack == null) return false;
+
+    try {
+      final path = await RecordingsRepository.instance.newRecordingPath();
+      _mediaRecorder = MediaRecorder();
+      await _mediaRecorder!.start(
+        path,
+        videoTrack: videoTrack,
+        audioChannel: RecorderAudioChannel.INPUT,
+      );
+      _recordingPath = path;
+      isRecording = true;
+      recordDuration = Duration.zero;
+      await WakelockPlus.enable();
+      _recordTimer?.cancel();
+      _recordTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+        recordDuration += const Duration(seconds: 1);
+        notifyListeners();
+      });
+      notifyListeners();
+      return true;
+    } catch (e) {
+      debugPrint('Stream recording start failed: $e');
+      errorMessage = e.toString();
+      await _cleanupRecorder();
+      notifyListeners();
+      return false;
+    }
+  }
+
+  Future<File?> stopRecording() async {
+    if (!isRecording) return null;
+    try {
+      await _mediaRecorder?.stop();
+      _recordTimer?.cancel();
+      isRecording = false;
+      if (!isLive) await WakelockPlus.disable();
+
+      final path = _recordingPath;
+      _recordingPath = null;
+      _mediaRecorder = null;
+      notifyListeners();
+      if (path != null && File(path).existsSync()) {
+        return File(path);
+      }
+    } catch (e) {
+      debugPrint('Stream recording stop failed: $e');
+      errorMessage = e.toString();
+    }
+    await _cleanupRecorder();
+    notifyListeners();
+    return null;
+  }
+
+  Future<File?> takeSnapshot() async {
+    final track = _videoTrack;
+    if (track == null || !isLive) return null;
+    try {
+      final buffer = await track.captureFrame();
+      final dir = await RecordingsRepository.instance.recordingsDir;
+      final dest = p.join(dir.path, 'snap_${DateTime.now().millisecondsSinceEpoch}.jpg');
+      await File(dest).writeAsBytes(buffer.asUint8List(), flush: true);
+      return File(dest);
+    } catch (e) {
+      debugPrint('Stream snapshot failed: $e');
+      errorMessage = e.toString();
+      notifyListeners();
+      return null;
+    }
+  }
+
+  Future<void> toggleTorch() async {
+    final track = _videoTrack;
+    if (track == null) return;
+    try {
+      if (await track.hasTorch()) {
+        torchOn = !torchOn;
+        await track.setTorch(torchOn);
+        notifyListeners();
+      }
+    } catch (e) {
+      debugPrint('Torch toggle failed: $e');
+    }
+  }
+
+  Future<void> _cleanupRecorder() async {
+    _recordTimer?.cancel();
+    _recordTimer = null;
+    isRecording = false;
+    _recordingPath = null;
+    try {
+      await _mediaRecorder?.stop();
+    } catch (_) {}
+    _mediaRecorder = null;
+    if (!isLive) await WakelockPlus.disable();
+  }
 
   Future<void> initRenderer() async {
     if (_rendererReady) return;
@@ -113,9 +224,8 @@ class WebRTCStreamService extends ChangeNotifier {
       'audio': true,
       'video': {
         'facingMode': _useFrontCamera ? 'user' : 'environment',
-        // 720p max keeps multi-viewer encoding stable on mid-range Android phones.
-        'width': 960,
-        'height': 540,
+        'width': 1280,
+        'height': 720,
         'frameRate': 24,
       },
     };
@@ -534,8 +644,8 @@ class WebRTCStreamService extends ChangeNotifier {
       'audio': false,
       'video': {
         'facingMode': front ? 'user' : 'environment',
-        'width': 960,
-        'height': 540,
+        'width': 1280,
+        'height': 720,
         'frameRate': 24,
       },
     });
@@ -578,6 +688,12 @@ class WebRTCStreamService extends ChangeNotifier {
   }
 
   Future<void> stop() async {
+    if (isRecording) {
+      await stopRecording();
+    }
+    torchOn = false;
+    recordDuration = Duration.zero;
+
     streamState = StreamState.off;
     viewerCount = 0;
     isSwitchingCamera = false;
