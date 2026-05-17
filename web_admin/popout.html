@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>RoadGuard — Pop-out monitor</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { background: #000; height: 100vh; display: flex; flex-direction: column; }
+    header {
+      padding: 8px 12px;
+      background: #141b26;
+      color: #94a3b8;
+      font: 12px system-ui, sans-serif;
+      border-bottom: 1px solid #2a3544;
+    }
+    video { flex: 1; width: 100%; object-fit: contain; background: #000; }
+    .msg {
+      flex: 1;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: #64748b;
+      font: 14px system-ui, sans-serif;
+      padding: 24px;
+      text-align: center;
+    }
+  </style>
+</head>
+<body>
+  <header>RoadGuard pop-out — shares the main watch tab (one stream)</header>
+  <video id="video" autoplay playsinline style="display:none"></video>
+  <div id="wait" class="msg">Connecting to main watch tab…</div>
+  <script>
+    const video = document.getElementById('video');
+    const wait = document.getElementById('wait');
+
+    function attach() {
+      try {
+        if (!window.opener || window.opener.closed) return false;
+        const src = window.opener.document.getElementById('remoteVideo');
+        if (!src || !src.srcObject) return false;
+        video.srcObject = src.srcObject;
+        video.style.display = 'block';
+        wait.style.display = 'none';
+        return true;
+      } catch (e) {
+        wait.textContent = 'Cannot access main tab: ' + e.message;
+        return false;
+      }
+    }
+
+    if (!attach()) {
+      const t = setInterval(() => {
+        if (attach()) clearInterval(t);
+      }, 500);
+      setTimeout(() => {
+        clearInterval(t);
+        if (!video.srcObject) {
+          wait.textContent =
+            'Open this window from Pop-out monitor on the main watch page, ' +
+            'and keep that tab connected.';
+        }
+      }, 15000);
+    }
+  </script>
+</body>
+</html>

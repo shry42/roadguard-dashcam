@@ -7,6 +7,7 @@
     "start": "node signaling-server.js"
   },
   "dependencies": {
+    "@roamhq/wrtc": "^0.8.0",
     "ws": "^8.18.0"
   }
 }

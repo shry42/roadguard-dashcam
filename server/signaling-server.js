@@ -1,18 +1,29 @@
 /**
- * RoadGuard — WebRTC signaling + REST config for website integration.
- * Run: npm install && npm start
- *
- * Internet / different locations:
- *   1. Deploy this server on a VPS or expose with Cloudflare Tunnel (free).
- *   2. Set PUBLIC_WS_URL=wss://your-domain.com (or ws://your-ip:8080)
- *   3. Phone app Settings → same WebSocket URL + room ID
- *   4. Website: GET /api/stream-config?room=dashcam-1
+ * RoadGuard — WebRTC signaling + optional server media relay for multi-tab viewers.
  */
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const WebSocket = require('ws');
+
+const { RELAY_ID, createMediaRelay } = require('./media-relay');
+
+let wrtc = null;
+let mediaRelay = null;
+let useRelay = false;
+
+try {
+  wrtc = require('@roamhq/wrtc');
+  useRelay = process.env.DISABLE_RELAY !== '1';
+  if (useRelay) {
+    mediaRelay = createMediaRelay(wrtc, getIceServers);
+    console.log('Media relay enabled (multi-tab / multi-viewer)');
+  }
+} catch (e) {
+  console.warn('Media relay unavailable (@roamhq/wrtc):', e.message);
+  console.warn('Falling back to direct phone ↔ viewer connections');
+}
 
 const PORT = process.env.PORT || 8080;
 const PUBLIC_WS_URL = process.env.PUBLIC_WS_URL || '';
@@ -30,10 +41,8 @@ function resolveWebDir() {
 }
 
 const WEB_DIR = resolveWebDir();
-
 const rooms = new Map();
 
-/** Free TURN relay for NAT traversal (Metered Open Relay). */
 function getIceServers() {
   const extra = process.env.TURN_URL
     ? [
@@ -120,6 +129,7 @@ function handleStreamConfigApi(req, res) {
     configUrl,
     iceServers: getIceServers(),
     maxViewers: MAX_VIEWERS,
+    relayMode: useRelay,
     viewerJoin: { type: 'join', room: roomId, role: 'viewer' },
     publisherJoin: { type: 'join', room: roomId, role: 'publisher' },
     instructions:
@@ -178,12 +188,18 @@ wss.on('connection', (ws) => {
 
       if (ws.role === 'publisher') {
         room.publisher = ws;
-        send(ws, { type: 'joined', role: 'publisher', room: ws.roomId });
-        notifyPublisherCount(room);
-        // If viewers are already waiting, tell publisher about each one.
-        room.viewers.forEach((viewerWs, viewerId) => {
-          send(ws, { type: 'viewer-joined', viewerId });
+        send(ws, {
+          type: 'joined',
+          role: 'publisher',
+          room: ws.roomId,
+          relayMode: useRelay,
         });
+        notifyPublisherCount(room);
+        if (!useRelay) {
+          room.viewers.forEach((_, viewerId) => {
+            send(ws, { type: 'viewer-joined', viewerId });
+          });
+        }
       } else if (ws.role === 'viewer') {
         if (viewerCount(room) >= MAX_VIEWERS) {
           send(ws, {
@@ -195,16 +211,28 @@ wss.on('connection', (ws) => {
         const viewerId = crypto.randomUUID();
         ws.viewerId = viewerId;
         room.viewers.set(viewerId, ws);
-        send(ws, { type: 'joined', role: 'viewer', room: ws.roomId, viewerId });
-        if (room.publisher) {
+        send(ws, {
+          type: 'joined',
+          role: 'viewer',
+          room: ws.roomId,
+          viewerId,
+          relayMode: useRelay,
+        });
+
+        if (useRelay && mediaRelay) {
+          mediaRelay.onViewerJoined(room, viewerId, ws, send);
+          if (room.publisher && mediaRelay.needsPublisherRelay(room)) {
+            send(room.publisher, { type: 'viewer-joined', viewerId: RELAY_ID });
+          }
+        } else if (room.publisher) {
           send(room.publisher, { type: 'viewer-joined', viewerId });
-          notifyPublisherCount(room);
         } else {
           send(ws, {
             type: 'info',
             message: 'Connected. Waiting for dashcam to start streaming…',
           });
         }
+        notifyPublisherCount(room);
       }
       return;
     }
@@ -214,19 +242,42 @@ wss.on('connection', (ws) => {
 
     if (msg.type === 'offer') {
       const viewerId = msg.viewerId;
+
+      if (useRelay && mediaRelay && viewerId === RELAY_ID && ws.role === 'publisher') {
+        mediaRelay.handlePublisherOffer(room, msg, ws, send).catch((e) => {
+          console.error('Relay publisher offer failed:', e);
+        });
+        return;
+      }
+
       if (!viewerId) {
-        // Legacy publisher: one offer → all viewers in the room.
         room.viewers.forEach((viewerWs) => send(viewerWs, msg));
         return;
       }
       const viewer = room.viewers.get(viewerId);
       if (viewer) send(viewer, msg);
     } else if (msg.type === 'answer') {
+      if (useRelay && mediaRelay && ws.role === 'viewer') {
+        mediaRelay.handleViewerAnswer(room, msg, ws).catch((e) => {
+          console.error('Relay viewer answer failed:', e);
+        });
+        return;
+      }
       if (room.publisher) {
-        const payload = { ...msg, viewerId: msg.viewerId || ws.viewerId };
-        send(room.publisher, payload);
+        send(room.publisher, { ...msg, viewerId: msg.viewerId || ws.viewerId });
       }
     } else if (msg.type === 'ice') {
+      if (useRelay && mediaRelay) {
+        if (ws.role === 'publisher' && msg.viewerId === RELAY_ID) {
+          mediaRelay.handlePublisherIce(room, msg).catch(() => {});
+          return;
+        }
+        if (ws.role === 'viewer') {
+          mediaRelay.handleViewerIce(room, msg, ws).catch(() => {});
+          return;
+        }
+      }
+
       if (ws.role === 'publisher') {
         const viewerId = msg.viewerId;
         if (!viewerId) {
@@ -246,11 +297,15 @@ wss.on('connection', (ws) => {
     const room = getRoom(ws.roomId);
     if (ws.role === 'publisher' && room.publisher === ws) {
       room.publisher = null;
+      if (useRelay && mediaRelay) mediaRelay.onPublisherLeft(room);
     }
     if (ws.role === 'viewer' && ws.viewerId) {
       room.viewers.delete(ws.viewerId);
+      if (useRelay && mediaRelay) mediaRelay.onViewerLeft(room, ws.viewerId);
       if (room.publisher) {
-        send(room.publisher, { type: 'viewer-left', viewerId: ws.viewerId });
+        if (!useRelay) {
+          send(room.publisher, { type: 'viewer-left', viewerId: ws.viewerId });
+        }
         notifyPublisherCount(room);
       }
     }
@@ -262,7 +317,5 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log(`REST API:  http://0.0.0.0:${PORT}/api/stream-config?room=dashcam-1`);
   console.log(`WebSocket: ${PUBLIC_WS_URL || `ws://<public-ip>:${PORT}`}`);
   console.log(`Max viewers per room: ${MAX_VIEWERS}`);
-  if (!PUBLIC_WS_URL) {
-    console.log('Tip: set PUBLIC_WS_URL=wss://your-domain.com when using HTTPS tunnel');
-  }
+  console.log(`Relay mode: ${useRelay ? 'ON' : 'OFF'}`);
 });

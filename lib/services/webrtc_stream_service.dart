@@ -35,8 +35,12 @@ class WebRTCStreamService extends ChangeNotifier {
   final List<String> _viewerJoinQueue = [];
   bool _processingViewerQueue = false;
   final Map<String, List<RTCIceCandidate>> _pendingRemoteIce = {};
+  bool _serverRelayMode = false;
 
-  /// Android struggles beyond ~2 HW-encoded outgoing streams; prefer one browser tab per device.
+  /// Server ingests one stream; fans out to browsers (multi-tab safe).
+  static const relayViewerId = '__relay__';
+
+  /// Direct phone→viewer only when relay is off (max 2 on Android).
   static const int maxPublisherPeers = 2;
 
   bool get isLive => streamState == StreamState.live;
@@ -87,7 +91,11 @@ class WebRTCStreamService extends ChangeNotifier {
 
       streamState = StreamState.live;
       notifyListeners();
-      await _flushPendingViewers();
+      if (_serverRelayMode) {
+        await _ensureRelayConnection();
+      } else {
+        await _flushPendingViewers();
+      }
     } catch (e) {
       errorMessage = e.toString();
       streamState = StreamState.error;
@@ -159,12 +167,32 @@ class WebRTCStreamService extends ChangeNotifier {
     _useLegacySignaling = false;
     await _closeLegacyPeer();
 
+    if (_serverRelayMode) {
+      await _ensureRelayConnection();
+      return;
+    }
+
     if (_localStream == null || !isLive) {
       _pendingViewers.add(viewerId);
       debugPrint('Queued viewer $viewerId (stream not live yet)');
       return;
     }
     _enqueueViewerJoin(viewerId);
+  }
+
+  Future<void> _ensureRelayConnection() async {
+    if (_viewerPeers.containsKey(relayViewerId)) return;
+    if (_localStream == null || !isLive) return;
+
+    try {
+      debugPrint('Starting server relay connection');
+      final pc = await _createPeerConnectionForViewer(relayViewerId);
+      _viewerPeers[relayViewerId] = pc;
+      await _sendOfferToViewer(relayViewerId, pc);
+    } catch (e) {
+      debugPrint('Relay connection failed: $e');
+      await _closeViewer(relayViewerId);
+    }
   }
 
   void _enqueueViewerJoin(String viewerId) {
@@ -334,6 +362,18 @@ class WebRTCStreamService extends ChangeNotifier {
   void _onSignalMessage(dynamic raw) {
     final msg = jsonDecode(raw as String) as Map<String, dynamic>;
     switch (msg['type']) {
+      case 'joined':
+        if (msg['role'] == 'publisher') {
+          _serverRelayMode = msg['relayMode'] == true;
+          debugPrint('Signaling relayMode=$_serverRelayMode');
+          if (isLive) {
+            if (_serverRelayMode) {
+              unawaited(_ensureRelayConnection());
+            } else {
+              unawaited(_flushPendingViewers());
+            }
+          }
+        }
       case 'viewer-count':
         viewerCount = msg['count'] as int? ?? 0;
         notifyListeners();
@@ -344,8 +384,10 @@ class WebRTCStreamService extends ChangeNotifier {
         final id = msg['viewerId'] as String?;
         if (id != null) unawaited(_onViewerJoined(id));
       case 'viewer-left':
-        final id = msg['viewerId'] as String?;
-        if (id != null) unawaited(_closeViewer(id));
+        if (!_serverRelayMode) {
+          final id = msg['viewerId'] as String?;
+          if (id != null) unawaited(_closeViewer(id));
+        }
       case 'answer':
         unawaited(_handleAnswer(msg));
       case 'ice':
@@ -567,6 +609,7 @@ class WebRTCStreamService extends ChangeNotifier {
     _viewerJoinQueue.clear();
     _processingViewerQueue = false;
     _pendingRemoteIce.clear();
+    _serverRelayMode = false;
     unawaited(DashcamService.instance.initialize());
   }
 }
