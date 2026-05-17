@@ -11,10 +11,13 @@
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const WebSocket = require('ws');
 
 const PORT = process.env.PORT || 8080;
 const PUBLIC_WS_URL = process.env.PUBLIC_WS_URL || '';
+const MAX_VIEWERS = parseInt(process.env.MAX_VIEWERS || '5', 10);
+
 function resolveWebDir() {
   const candidates = [
     path.join(__dirname, 'web_admin'),
@@ -64,7 +67,7 @@ function getIceServers() {
 
 function getRoom(id) {
   if (!rooms.has(id)) {
-    rooms.set(id, { publisher: null, viewers: new Set() });
+    rooms.set(id, { publisher: null, viewers: new Map() });
   }
   return rooms.get(id);
 }
@@ -75,18 +78,13 @@ function send(ws, data) {
   }
 }
 
-function broadcastViewers(room, data) {
-  room.viewers.forEach((v) => send(v, data));
-}
-
 function viewerCount(room) {
   return room.viewers.size;
 }
 
-function notifyPublisher(room) {
+function notifyPublisherCount(room) {
   if (room.publisher) {
     send(room.publisher, { type: 'viewer-count', count: viewerCount(room) });
-    send(room.publisher, { type: 'start-offer' });
   }
 }
 
@@ -121,6 +119,7 @@ function handleStreamConfigApi(req, res) {
     roomId,
     configUrl,
     iceServers: getIceServers(),
+    maxViewers: MAX_VIEWERS,
     viewerJoin: { type: 'join', room: roomId, role: 'viewer' },
     publisherJoin: { type: 'join', room: roomId, role: 'publisher' },
     instructions:
@@ -162,6 +161,7 @@ const wss = new WebSocket.Server({ server });
 wss.on('connection', (ws) => {
   ws.roomId = null;
   ws.role = null;
+  ws.viewerId = null;
 
   ws.on('message', (raw) => {
     let msg;
@@ -179,11 +179,27 @@ wss.on('connection', (ws) => {
       if (ws.role === 'publisher') {
         room.publisher = ws;
         send(ws, { type: 'joined', role: 'publisher', room: ws.roomId });
-        notifyPublisher(room);
+        notifyPublisherCount(room);
+        // If viewers are already waiting, tell publisher about each one.
+        room.viewers.forEach((viewerWs, viewerId) => {
+          send(ws, { type: 'viewer-joined', viewerId });
+        });
       } else if (ws.role === 'viewer') {
-        room.viewers.add(ws);
-        send(ws, { type: 'joined', role: 'viewer', room: ws.roomId });
-        notifyPublisher(room);
+        if (viewerCount(room) >= MAX_VIEWERS) {
+          send(ws, {
+            type: 'error',
+            message: `Room is full (max ${MAX_VIEWERS} viewers). Try again later.`,
+          });
+          return;
+        }
+        const viewerId = crypto.randomUUID();
+        ws.viewerId = viewerId;
+        room.viewers.set(viewerId, ws);
+        send(ws, { type: 'joined', role: 'viewer', room: ws.roomId, viewerId });
+        if (room.publisher) {
+          send(room.publisher, { type: 'viewer-joined', viewerId });
+          notifyPublisherCount(room);
+        }
       }
       return;
     }
@@ -192,14 +208,23 @@ wss.on('connection', (ws) => {
     const room = getRoom(ws.roomId);
 
     if (msg.type === 'offer') {
-      broadcastViewers(room, msg);
+      const viewerId = msg.viewerId;
+      if (!viewerId) return;
+      const viewer = room.viewers.get(viewerId);
+      if (viewer) send(viewer, msg);
     } else if (msg.type === 'answer') {
-      send(room.publisher, msg);
+      if (room.publisher) {
+        const payload = { ...msg, viewerId: msg.viewerId || ws.viewerId };
+        send(room.publisher, payload);
+      }
     } else if (msg.type === 'ice') {
       if (ws.role === 'publisher') {
-        broadcastViewers(room, msg);
-      } else {
-        send(room.publisher, msg);
+        const viewerId = msg.viewerId;
+        if (!viewerId) return;
+        const viewer = room.viewers.get(viewerId);
+        if (viewer) send(viewer, msg);
+      } else if (ws.role === 'viewer' && room.publisher) {
+        send(room.publisher, { ...msg, viewerId: ws.viewerId });
       }
     }
   });
@@ -210,9 +235,12 @@ wss.on('connection', (ws) => {
     if (ws.role === 'publisher' && room.publisher === ws) {
       room.publisher = null;
     }
-    if (ws.role === 'viewer') {
-      room.viewers.delete(ws);
-      notifyPublisher(room);
+    if (ws.role === 'viewer' && ws.viewerId) {
+      room.viewers.delete(ws.viewerId);
+      if (room.publisher) {
+        send(room.publisher, { type: 'viewer-left', viewerId: ws.viewerId });
+        notifyPublisherCount(room);
+      }
     }
   });
 });
@@ -221,6 +249,7 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log(`RoadGuard server http://0.0.0.0:${PORT}`);
   console.log(`REST API:  http://0.0.0.0:${PORT}/api/stream-config?room=dashcam-1`);
   console.log(`WebSocket: ${PUBLIC_WS_URL || `ws://<public-ip>:${PORT}`}`);
+  console.log(`Max viewers per room: ${MAX_VIEWERS}`);
   if (!PUBLIC_WS_URL) {
     console.log('Tip: set PUBLIC_WS_URL=wss://your-domain.com when using HTTPS tunnel');
   }

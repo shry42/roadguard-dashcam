@@ -18,13 +18,16 @@ class WebRTCStreamService extends ChangeNotifier {
   StreamState streamState = StreamState.off;
   String? errorMessage;
   int viewerCount = 0;
+  bool isSwitchingCamera = false;
 
-  RTCPeerConnection? _peerConnection;
   MediaStream? _localStream;
+  final Map<String, RTCPeerConnection> _viewerPeers = {};
   final RTCVideoRenderer localRenderer = RTCVideoRenderer();
   WebSocketChannel? _channel;
   bool _rendererReady = false;
   bool _useFrontCamera = false;
+  bool _switchInFlight = false;
+  List<Map<String, dynamic>>? _iceServers;
 
   bool get isLive => streamState == StreamState.live;
   bool get isConnecting => streamState == StreamState.connecting;
@@ -49,6 +52,11 @@ class WebRTCStreamService extends ChangeNotifier {
       await DashcamService.instance.disposeCamera();
 
       final settings = AppSettings.instance;
+      _iceServers = await StreamConfigService.loadIceServers(
+        signalingUrl: settings.signalingUrl,
+        roomId: settings.roomId,
+      );
+
       _channel = WebSocketChannel.connect(Uri.parse(settings.signalingUrl));
 
       _channel!.stream.listen(_onSignalMessage, onError: (e) {
@@ -57,7 +65,7 @@ class WebRTCStreamService extends ChangeNotifier {
         notifyListeners();
       }, onDone: () {
         if (streamState == StreamState.live) {
-          stop();
+          unawaited(stop());
         }
       });
 
@@ -65,7 +73,6 @@ class WebRTCStreamService extends ChangeNotifier {
       _send({'type': 'join', 'room': settings.roomId, 'role': 'publisher'});
 
       await _createLocalStream();
-      await _createPeerConnection();
 
       streamState = StreamState.live;
       notifyListeners();
@@ -94,19 +101,17 @@ class WebRTCStreamService extends ChangeNotifier {
     localRenderer.srcObject = _localStream;
   }
 
-  Future<void> _createPeerConnection() async {
-    final settings = AppSettings.instance;
-    final iceServers = await StreamConfigService.loadIceServers(
-      signalingUrl: settings.signalingUrl,
-      roomId: settings.roomId,
-    );
-    final config = <String, dynamic>{'iceServers': iceServers};
-    _peerConnection = await createPeerConnection(config);
+  Future<RTCPeerConnection> _createPeerConnectionForViewer(String viewerId) async {
+    final config = <String, dynamic>{
+      'iceServers': _iceServers ?? await _loadIceServersFallback(),
+    };
+    final pc = await createPeerConnection(config);
 
-    _peerConnection!.onIceCandidate = (RTCIceCandidate candidate) {
+    pc.onIceCandidate = (RTCIceCandidate candidate) {
       if (candidate.candidate != null) {
         _send({
           'type': 'ice',
+          'viewerId': viewerId,
           'candidate': candidate.candidate,
           'sdpMid': candidate.sdpMid,
           'sdpMLineIndex': candidate.sdpMLineIndex,
@@ -114,8 +119,58 @@ class WebRTCStreamService extends ChangeNotifier {
       }
     };
 
-    for (final track in _localStream!.getTracks()) {
-      await _peerConnection!.addTrack(track, _localStream!);
+    final stream = _localStream;
+    if (stream != null) {
+      for (final track in stream.getTracks()) {
+        await pc.addTrack(track, stream);
+      }
+    }
+
+    return pc;
+  }
+
+  Future<List<Map<String, dynamic>>> _loadIceServersFallback() async {
+    final settings = AppSettings.instance;
+    return StreamConfigService.loadIceServers(
+      signalingUrl: settings.signalingUrl,
+      roomId: settings.roomId,
+    );
+  }
+
+  Future<void> _onViewerJoined(String viewerId) async {
+    if (!isLive || _localStream == null) return;
+    if (_viewerPeers.containsKey(viewerId)) return;
+
+    try {
+      final pc = await _createPeerConnectionForViewer(viewerId);
+      _viewerPeers[viewerId] = pc;
+      await _sendOfferToViewer(viewerId, pc);
+    } catch (e) {
+      debugPrint('viewer-joined failed for $viewerId: $e');
+      await _closeViewer(viewerId);
+    }
+  }
+
+  Future<void> _sendOfferToViewer(String viewerId, RTCPeerConnection pc) async {
+    final offer = await pc.createOffer({
+      'offerToReceiveAudio': false,
+      'offerToReceiveVideo': false,
+    });
+    await pc.setLocalDescription(offer);
+    _send({
+      'type': 'offer',
+      'viewerId': viewerId,
+      'sdp': offer.sdp,
+      'sdpType': offer.type,
+    });
+  }
+
+  Future<void> _closeViewer(String viewerId) async {
+    final pc = _viewerPeers.remove(viewerId);
+    if (pc != null) {
+      try {
+        await pc.close();
+      } catch (_) {}
     }
   }
 
@@ -125,12 +180,16 @@ class WebRTCStreamService extends ChangeNotifier {
       case 'viewer-count':
         viewerCount = msg['count'] as int? ?? 0;
         notifyListeners();
-      case 'start-offer':
-        _sendOffer();
+      case 'viewer-joined':
+        final id = msg['viewerId'] as String?;
+        if (id != null) unawaited(_onViewerJoined(id));
+      case 'viewer-left':
+        final id = msg['viewerId'] as String?;
+        if (id != null) unawaited(_closeViewer(id));
       case 'answer':
-        _handleAnswer(msg);
+        unawaited(_handleAnswer(msg));
       case 'ice':
-        _handleIce(msg);
+        unawaited(_handleIce(msg));
       case 'error':
         errorMessage = msg['message'] as String? ?? 'Signaling error';
         streamState = StreamState.error;
@@ -138,43 +197,152 @@ class WebRTCStreamService extends ChangeNotifier {
     }
   }
 
-  Future<void> _sendOffer() async {
-    if (_peerConnection == null) return;
-    final offer = await _peerConnection!.createOffer({
-      'offerToReceiveAudio': false,
-      'offerToReceiveVideo': false,
-    });
-    await _peerConnection!.setLocalDescription(offer);
-    _send({'type': 'offer', 'sdp': offer.sdp, 'sdpType': offer.type});
-  }
-
   Future<void> _handleAnswer(Map<String, dynamic> msg) async {
-    final answer = RTCSessionDescription(msg['sdp'] as String, msg['sdpType'] as String? ?? 'answer');
-    await _peerConnection?.setRemoteDescription(answer);
+    final viewerId = msg['viewerId'] as String?;
+    if (viewerId == null) return;
+    final pc = _viewerPeers[viewerId];
+    if (pc == null) return;
+
+    final answer = RTCSessionDescription(
+      msg['sdp'] as String,
+      msg['sdpType'] as String? ?? 'answer',
+    );
+    await pc.setRemoteDescription(answer);
   }
 
   Future<void> _handleIce(Map<String, dynamic> msg) async {
+    final viewerId = msg['viewerId'] as String?;
+    if (viewerId == null) return;
+    final pc = _viewerPeers[viewerId];
+    if (pc == null) return;
+
     final candidate = RTCIceCandidate(
       msg['candidate'] as String?,
       msg['sdpMid'] as String?,
       msg['sdpMLineIndex'] as int?,
     );
-    await _peerConnection?.addCandidate(candidate);
+    await pc.addCandidate(candidate);
   }
 
   void _send(Map<String, dynamic> data) {
     _channel?.sink.add(jsonEncode(data));
   }
 
+  MediaStreamTrack? get _videoTrack {
+    final tracks = _localStream?.getVideoTracks() ?? [];
+    return tracks.isEmpty ? null : tracks.first;
+  }
+
+  /// Switch front/back while live — keeps WebSocket + peer connections alive.
+  Future<bool> switchCameraWhileStreaming(bool front) async {
+    if (!isLive || _switchInFlight) return false;
+    if (_useFrontCamera == front) return true;
+
+    _switchInFlight = true;
+    isSwitchingCamera = true;
+    notifyListeners();
+
+    try {
+      await _switchVideoTrackWithNewStream(front).timeout(
+        const Duration(seconds: 12),
+        onTimeout: () => throw TimeoutException('Camera switch timed out'),
+      );
+      _useFrontCamera = front;
+      localRenderer.srcObject = _localStream;
+      if (_viewerPeers.isNotEmpty) {
+        await _renegotiateWithAllViewers();
+      }
+      return true;
+    } catch (e) {
+      debugPrint('switchCameraWhileStreaming: $e');
+      errorMessage = 'Camera switch failed: $e';
+      notifyListeners();
+      return false;
+    } finally {
+      isSwitchingCamera = false;
+      _switchInFlight = false;
+      notifyListeners();
+    }
+  }
+
+  Future<void> _switchVideoTrackWithNewStream(bool front) async {
+    final stream = _localStream;
+    if (stream == null) {
+      throw StateError('Stream not ready');
+    }
+
+    final oldVideo = _videoTrack;
+    if (oldVideo != null) {
+      try {
+        await oldVideo.stop();
+      } catch (_) {}
+      try {
+        await stream.removeTrack(oldVideo);
+      } catch (_) {}
+      await Future<void>.delayed(const Duration(milliseconds: 150));
+    }
+
+    final videoOnly = await navigator.mediaDevices.getUserMedia({
+      'audio': false,
+      'video': {
+        'facingMode': front ? 'user' : 'environment',
+        'width': 1280,
+        'height': 720,
+      },
+    });
+
+    final newVideo = videoOnly.getVideoTracks().first;
+    await stream.addTrack(newVideo);
+    localRenderer.srcObject = stream;
+
+    for (final entry in _viewerPeers.entries) {
+      final senders = await entry.value.getSenders();
+      for (final sender in senders) {
+        if (sender.track?.kind == 'video') {
+          await sender.replaceTrack(newVideo);
+          break;
+        }
+      }
+    }
+
+    for (final t in videoOnly.getAudioTracks()) {
+      try {
+        await t.stop();
+      } catch (_) {}
+    }
+  }
+
+  Future<void> _renegotiateWithAllViewers() async {
+    for (final entry in Map<String, RTCPeerConnection>.from(_viewerPeers).entries) {
+      final pc = entry.value;
+      final state = pc.signalingState;
+      if (state != RTCSignalingState.RTCSignalingStateStable &&
+          state != RTCSignalingState.RTCSignalingStateHaveRemoteOffer) {
+        continue;
+      }
+      try {
+        await _sendOfferToViewer(entry.key, pc);
+      } catch (e) {
+        debugPrint('Renegotiation failed for ${entry.key}: $e');
+      }
+    }
+  }
+
   Future<void> stop() async {
     streamState = StreamState.off;
     viewerCount = 0;
+    isSwitchingCamera = false;
+    _switchInFlight = false;
     notifyListeners();
 
     try {
       await _channel?.sink.close();
     } catch (_) {}
     _channel = null;
+
+    for (final id in _viewerPeers.keys.toList()) {
+      await _closeViewer(id);
+    }
 
     try {
       await _localStream?.dispose();
@@ -184,20 +352,7 @@ class WebRTCStreamService extends ChangeNotifier {
       localRenderer.srcObject = null;
     } catch (_) {}
 
-    try {
-      await _peerConnection?.close();
-    } catch (_) {}
-    _peerConnection = null;
-
-    // Restore dashcam preview without blocking the UI thread.
+    _iceServers = null;
     unawaited(DashcamService.instance.initialize());
   }
-
-  Future<void> switchCameraWhileStreaming(bool front) async {
-    if (!isLive) return;
-    _useFrontCamera = front;
-    await stop();
-    await start(frontCamera: front);
-  }
-
 }

@@ -169,7 +169,8 @@
     const defaultRoom = params.get('room') || 'dashcam-1';
     roomIdInput.value = defaultRoom;
 
-    let ws, pc, iceServers = [{ urls: 'stun:stun.l.google.com:19302' }];
+    let ws, pc, myViewerId = null;
+    let iceServers = [{ urls: 'stun:stun.l.google.com:19302' }];
 
     async function loadStreamConfig() {
       const room = roomIdInput.value.trim() || defaultRoom;
@@ -221,9 +222,10 @@
       };
 
       pc.onicecandidate = (e) => {
-        if (e.candidate && ws?.readyState === WebSocket.OPEN) {
+        if (e.candidate && ws?.readyState === WebSocket.OPEN && myViewerId) {
           ws.send(JSON.stringify({
             type: 'ice',
+            viewerId: myViewerId,
             candidate: e.candidate.candidate,
             sdpMid: e.candidate.sdpMid,
             sdpMLineIndex: e.candidate.sdpMLineIndex,
@@ -249,14 +251,41 @@
 
       ws.onmessage = async (ev) => {
         const msg = JSON.parse(ev.data);
+        if (msg.type === 'joined' && msg.viewerId) {
+          myViewerId = msg.viewerId;
+          log('Ready as viewer ' + myViewerId.slice(0, 8) + '…');
+          return;
+        }
+        if (msg.type === 'error') {
+          log(msg.message || 'Signaling error');
+          return;
+        }
         if (msg.type === 'offer') {
-          log('Got offer from phone');
-          await pc.setRemoteDescription({ type: 'offer', sdp: msg.sdp });
-          const answer = await pc.createAnswer();
-          await pc.setLocalDescription(answer);
-          ws.send(JSON.stringify({ type: 'answer', sdp: answer.sdp, sdpType: answer.type }));
-          log('Sent answer');
+          if (msg.viewerId && msg.viewerId !== myViewerId) return;
+          const isRenegotiation = !!pc.currentRemoteDescription;
+          log(isRenegotiation ? 'Camera switched — refreshing stream' : 'Got offer from phone');
+          try {
+            if (pc.signalingState === 'have-local-offer') {
+              await pc.setLocalDescription({ type: 'rollback' });
+            }
+            await pc.setRemoteDescription({ type: 'offer', sdp: msg.sdp });
+            const answer = await pc.createAnswer();
+            await pc.setLocalDescription(answer);
+            ws.send(JSON.stringify({
+              type: 'answer',
+              viewerId: myViewerId,
+              sdp: answer.sdp,
+              sdpType: answer.type,
+            }));
+            log('Sent answer');
+          } catch (e) {
+            log('Offer failed: ' + e);
+            if (isRenegotiation && remoteVideo.srcObject) {
+              log('Keeping previous video — track swap may still work');
+            }
+          }
         } else if (msg.type === 'ice' && msg.candidate) {
+          if (msg.viewerId && msg.viewerId !== myViewerId) return;
           await pc.addIceCandidate({
             candidate: msg.candidate,
             sdpMid: msg.sdpMid,
@@ -278,6 +307,7 @@
       setLive(false);
       placeholder.style.display = 'flex';
       remoteVideo.srcObject = null;
+      myViewerId = null;
       if (ws) { ws.close(); ws = null; }
       if (pc) { pc.close(); pc = null; }
       connectBtn.disabled = false;

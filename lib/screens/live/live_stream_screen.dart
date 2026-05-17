@@ -27,6 +27,7 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> with WidgetsBinding
   bool _useRoadCamera = true;
   bool _isStreaming = false;
   String _quality = '1080p';
+  bool _rebuildScheduled = false;
 
   @override
   void initState() {
@@ -80,8 +81,15 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> with WidgetsBinding
     }
   }
 
+  /// Services call [notifyListeners] during camera/WebRTC work, sometimes while
+  /// the widget tree is locked — schedule one rebuild after the current frame.
   void _onUpdate() {
-    if (mounted) setState(() {});
+    if (!mounted || _rebuildScheduled) return;
+    _rebuildScheduled = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _rebuildScheduled = false;
+      if (mounted) setState(() {});
+    });
   }
 
   ResolutionPreset _presetFromLabel(String q) => switch (q) {
@@ -129,12 +137,30 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> with WidgetsBinding
   }
 
   Future<void> _switchCamera(bool road) async {
-    setState(() => _useRoadCamera = road);
-    if (_stream.isLive) {
-      await _stream.switchCameraWhileStreaming(!road);
-    } else {
-      await _dashcam.switchCamera(front: !road);
+    if (_stream.isSwitchingCamera) return;
+
+    final wantFront = !road;
+    if (_stream.isLive || _stream.isConnecting) {
+      if (_useRoadCamera == road) return;
+      final ok = await _stream.switchCameraWhileStreaming(wantFront);
+      if (!mounted) return;
+      if (ok) {
+        setState(() => _useRoadCamera = road);
+      } else if (_stream.errorMessage != null) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text(_stream.errorMessage!)),
+        );
+      }
+      return;
     }
+
+    if (_dashcam.useFrontCamera == wantFront && _dashcam.isInitialized) {
+      setState(() => _useRoadCamera = road);
+      return;
+    }
+
+    setState(() => _useRoadCamera = road);
+    await _dashcam.switchCamera(front: wantFront);
   }
 
   @override
@@ -147,6 +173,7 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> with WidgetsBinding
         _buildBottomControls(),
         if (_dashcam.isRecording) _buildRecordingIndicator(),
         if (_stream.isConnecting) _buildConnectingOverlay(),
+        if (_stream.isSwitchingCamera) _buildSwitchingOverlay(),
       ],
     );
 
@@ -292,6 +319,22 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> with WidgetsBinding
     );
   }
 
+  Widget _buildSwitchingOverlay() {
+    return Container(
+      color: Colors.black54,
+      child: const Center(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            CircularProgressIndicator(color: AppColors.primary),
+            SizedBox(height: 16),
+            Text('Switching camera…', style: TextStyle(color: Colors.white)),
+          ],
+        ),
+      ),
+    );
+  }
+
   Widget _buildConnectingOverlay() {
     return Container(
       color: AppColors.overlay,
@@ -331,9 +374,19 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> with WidgetsBinding
             Row(
               mainAxisAlignment: MainAxisAlignment.center,
               children: [
-                _CamToggle(label: 'Road', selected: _useRoadCamera, onTap: () => _switchCamera(true)),
+                _CamToggle(
+                  label: 'Road',
+                  selected: _useRoadCamera,
+                  enabled: !_stream.isSwitchingCamera,
+                  onTap: () => _switchCamera(true),
+                ),
                 const SizedBox(width: 12),
-                _CamToggle(label: 'Cabin', selected: !_useRoadCamera, onTap: () => _switchCamera(false)),
+                _CamToggle(
+                  label: 'Cabin',
+                  selected: !_useRoadCamera,
+                  enabled: !_stream.isSwitchingCamera,
+                  onTap: () => _switchCamera(false),
+                ),
               ],
             ),
             const SizedBox(height: 24),
@@ -343,7 +396,7 @@ class _LiveStreamScreenState extends State<LiveStreamScreen> with WidgetsBinding
                 _ControlBtn(
                   icon: Icons.flip_camera_ios_rounded,
                   label: 'Flip',
-                  onTap: () => _switchCamera(!_useRoadCamera),
+                  onTap: _stream.isSwitchingCamera ? () {} : () => _switchCamera(!_useRoadCamera),
                 ),
                 GestureDetector(
                   onTap: _toggleRecording,
@@ -434,16 +487,22 @@ class _TopChip extends StatelessWidget {
 }
 
 class _CamToggle extends StatelessWidget {
-  const _CamToggle({required this.label, required this.selected, required this.onTap});
+  const _CamToggle({
+    required this.label,
+    required this.selected,
+    required this.onTap,
+    this.enabled = true,
+  });
 
   final String label;
   final bool selected;
   final VoidCallback onTap;
+  final bool enabled;
 
   @override
   Widget build(BuildContext context) {
     return GestureDetector(
-      onTap: onTap,
+      onTap: enabled ? onTap : null,
       child: AnimatedContainer(
         duration: const Duration(milliseconds: 200),
         padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 10),
@@ -451,11 +510,14 @@ class _CamToggle extends StatelessWidget {
           color: selected ? AppColors.primary : AppColors.overlay,
           borderRadius: BorderRadius.circular(24),
         ),
-        child: Text(
-          label,
-          style: TextStyle(
-            color: selected ? AppColors.background : Colors.white,
-            fontWeight: FontWeight.w600,
+        child: Opacity(
+          opacity: enabled ? 1 : 0.45,
+          child: Text(
+            label,
+            style: TextStyle(
+              color: selected ? AppColors.background : Colors.white,
+              fontWeight: FontWeight.w600,
+            ),
           ),
         ),
       ),
