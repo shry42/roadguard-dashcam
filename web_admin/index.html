@@ -170,6 +170,7 @@
     roomIdInput.value = defaultRoom;
 
     let ws, pc, myViewerId = null;
+    let pendingOffer = null;
     let iceServers = [{ urls: 'stun:stun.l.google.com:19302' }];
 
     async function loadStreamConfig() {
@@ -223,13 +224,14 @@
 
       pc.onicecandidate = (e) => {
         if (e.candidate && ws?.readyState === WebSocket.OPEN && myViewerId) {
-          ws.send(JSON.stringify({
+          const iceMsg = {
             type: 'ice',
-            viewerId: myViewerId,
             candidate: e.candidate.candidate,
             sdpMid: e.candidate.sdpMid,
             sdpMLineIndex: e.candidate.sdpMLineIndex,
-          }));
+          };
+          if (myViewerId !== 'legacy') iceMsg.viewerId = myViewerId;
+          ws.send(JSON.stringify(iceMsg));
         }
       };
 
@@ -249,11 +251,50 @@
         disconnectBtn.disabled = false;
       };
 
+      async function handleOffer(msg) {
+        if (msg.viewerId && myViewerId && myViewerId !== 'legacy' && msg.viewerId !== myViewerId) return;
+        const isRenegotiation = !!pc.currentRemoteDescription;
+        log(isRenegotiation ? 'Camera switched — refreshing stream' : 'Got offer from phone');
+        try {
+          if (pc.signalingState === 'have-local-offer') {
+            await pc.setLocalDescription({ type: 'rollback' });
+          }
+          await pc.setRemoteDescription({ type: 'offer', sdp: msg.sdp });
+          const answer = await pc.createAnswer();
+          await pc.setLocalDescription(answer);
+          const answerMsg = {
+            type: 'answer',
+            sdp: answer.sdp,
+            sdpType: answer.type,
+          };
+          if (myViewerId && myViewerId !== 'legacy') answerMsg.viewerId = myViewerId;
+          ws.send(JSON.stringify(answerMsg));
+          log('Sent answer');
+        } catch (e) {
+          log('Offer failed: ' + e);
+          if (isRenegotiation && remoteVideo.srcObject) {
+            log('Keeping previous video — track swap may still work');
+          }
+        }
+      }
+
       ws.onmessage = async (ev) => {
         const msg = JSON.parse(ev.data);
-        if (msg.type === 'joined' && msg.viewerId) {
-          myViewerId = msg.viewerId;
-          log('Ready as viewer ' + myViewerId.slice(0, 8) + '…');
+        log('← ' + (msg.type || 'message'));
+
+        if (msg.type === 'joined') {
+          if (msg.viewerId) {
+            myViewerId = msg.viewerId;
+            log('Ready as viewer ' + myViewerId.slice(0, 8) + '…');
+          } else {
+            myViewerId = 'legacy';
+            log('Joined room (legacy mode — redeploy Render for multi-viewer)');
+          }
+          if (pendingOffer) {
+            const offer = pendingOffer;
+            pendingOffer = null;
+            await handleOffer(offer);
+          }
           return;
         }
         if (msg.type === 'error') {
@@ -261,36 +302,23 @@
           return;
         }
         if (msg.type === 'offer') {
-          if (msg.viewerId && msg.viewerId !== myViewerId) return;
-          const isRenegotiation = !!pc.currentRemoteDescription;
-          log(isRenegotiation ? 'Camera switched — refreshing stream' : 'Got offer from phone');
-          try {
-            if (pc.signalingState === 'have-local-offer') {
-              await pc.setLocalDescription({ type: 'rollback' });
-            }
-            await pc.setRemoteDescription({ type: 'offer', sdp: msg.sdp });
-            const answer = await pc.createAnswer();
-            await pc.setLocalDescription(answer);
-            ws.send(JSON.stringify({
-              type: 'answer',
-              viewerId: myViewerId,
-              sdp: answer.sdp,
-              sdpType: answer.type,
-            }));
-            log('Sent answer');
-          } catch (e) {
-            log('Offer failed: ' + e);
-            if (isRenegotiation && remoteVideo.srcObject) {
-              log('Keeping previous video — track swap may still work');
-            }
+          if (!myViewerId) {
+            pendingOffer = msg;
+            log('Offer queued — waiting to join…');
+            return;
           }
+          await handleOffer(msg);
         } else if (msg.type === 'ice' && msg.candidate) {
-          if (msg.viewerId && msg.viewerId !== myViewerId) return;
-          await pc.addIceCandidate({
-            candidate: msg.candidate,
-            sdpMid: msg.sdpMid,
-            sdpMLineIndex: msg.sdpMLineIndex,
-          });
+          if (msg.viewerId && myViewerId && myViewerId !== 'legacy' && msg.viewerId !== myViewerId) return;
+          try {
+            await pc.addIceCandidate({
+              candidate: msg.candidate,
+              sdpMid: msg.sdpMid,
+              sdpMLineIndex: msg.sdpMLineIndex,
+            });
+          } catch (e) {
+            log('ICE error: ' + e);
+          }
         }
       };
 
@@ -308,6 +336,7 @@
       placeholder.style.display = 'flex';
       remoteVideo.srcObject = null;
       myViewerId = null;
+      pendingOffer = null;
       if (ws) { ws.close(); ws = null; }
       if (pc) { pc.close(); pc = null; }
       connectBtn.disabled = false;

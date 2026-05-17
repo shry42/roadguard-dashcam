@@ -22,12 +22,15 @@ class WebRTCStreamService extends ChangeNotifier {
 
   MediaStream? _localStream;
   final Map<String, RTCPeerConnection> _viewerPeers = {};
+  /// Fallback for older signaling servers that use [start-offer] instead of [viewer-joined].
+  RTCPeerConnection? _legacyPeer;
   final RTCVideoRenderer localRenderer = RTCVideoRenderer();
   WebSocketChannel? _channel;
   bool _rendererReady = false;
   bool _useFrontCamera = false;
   bool _switchInFlight = false;
   List<Map<String, dynamic>>? _iceServers;
+  final Set<String> _pendingViewers = {};
 
   bool get isLive => streamState == StreamState.live;
   bool get isConnecting => streamState == StreamState.connecting;
@@ -70,12 +73,14 @@ class WebRTCStreamService extends ChangeNotifier {
       });
 
       await _waitForSocket();
-      _send({'type': 'join', 'room': settings.roomId, 'role': 'publisher'});
-
       await _createLocalStream();
+
+      // Join only after camera is ready so viewer-joined can create offers immediately.
+      _send({'type': 'join', 'room': settings.roomId, 'role': 'publisher'});
 
       streamState = StreamState.live;
       notifyListeners();
+      await _flushPendingViewers();
     } catch (e) {
       errorMessage = e.toString();
       streamState = StreamState.error;
@@ -101,7 +106,10 @@ class WebRTCStreamService extends ChangeNotifier {
     localRenderer.srcObject = _localStream;
   }
 
-  Future<RTCPeerConnection> _createPeerConnectionForViewer(String viewerId) async {
+  Future<RTCPeerConnection> _createPeerConnectionForViewer(
+    String viewerId, {
+    bool legacySignaling = false,
+  }) async {
     final config = <String, dynamic>{
       'iceServers': _iceServers ?? await _loadIceServersFallback(),
     };
@@ -109,13 +117,14 @@ class WebRTCStreamService extends ChangeNotifier {
 
     pc.onIceCandidate = (RTCIceCandidate candidate) {
       if (candidate.candidate != null) {
-        _send({
+        final ice = <String, dynamic>{
           'type': 'ice',
-          'viewerId': viewerId,
           'candidate': candidate.candidate,
           'sdpMid': candidate.sdpMid,
           'sdpMLineIndex': candidate.sdpMLineIndex,
-        });
+        };
+        if (!legacySignaling) ice['viewerId'] = viewerId;
+        _send(ice);
       }
     };
 
@@ -138,7 +147,11 @@ class WebRTCStreamService extends ChangeNotifier {
   }
 
   Future<void> _onViewerJoined(String viewerId) async {
-    if (!isLive || _localStream == null) return;
+    if (_localStream == null || !isLive) {
+      _pendingViewers.add(viewerId);
+      debugPrint('Queued viewer $viewerId (stream not live yet)');
+      return;
+    }
     if (_viewerPeers.containsKey(viewerId)) return;
 
     try {
@@ -151,18 +164,47 @@ class WebRTCStreamService extends ChangeNotifier {
     }
   }
 
-  Future<void> _sendOfferToViewer(String viewerId, RTCPeerConnection pc) async {
+  Future<void> _flushPendingViewers() async {
+    if (_pendingViewers.isEmpty) return;
+    final ids = _pendingViewers.toList();
+    _pendingViewers.clear();
+    for (final id in ids) {
+      await _onViewerJoined(id);
+    }
+  }
+
+  Future<void> _sendOfferToViewer(
+    String viewerId,
+    RTCPeerConnection pc, {
+    bool legacySignaling = false,
+  }) async {
     final offer = await pc.createOffer({
       'offerToReceiveAudio': false,
       'offerToReceiveVideo': false,
     });
     await pc.setLocalDescription(offer);
-    _send({
+    final payload = <String, dynamic>{
       'type': 'offer',
-      'viewerId': viewerId,
       'sdp': offer.sdp,
       'sdpType': offer.type,
-    });
+    };
+    if (!legacySignaling) payload['viewerId'] = viewerId;
+    _send(payload);
+  }
+
+  Future<void> _onLegacyStartOffer() async {
+    if (!isLive || _localStream == null) return;
+    if (_viewerPeers.isNotEmpty) return;
+
+    try {
+      _legacyPeer ??= await _createPeerConnectionForViewer(
+        'legacy',
+        legacySignaling: true,
+      );
+      await _sendOfferToViewer('legacy', _legacyPeer!, legacySignaling: true);
+    } catch (e) {
+      debugPrint('legacy start-offer failed: $e');
+    }
   }
 
   Future<void> _closeViewer(String viewerId) async {
@@ -180,6 +222,9 @@ class WebRTCStreamService extends ChangeNotifier {
       case 'viewer-count':
         viewerCount = msg['count'] as int? ?? 0;
         notifyListeners();
+      case 'start-offer':
+        unawaited(_flushPendingViewers());
+        unawaited(_onLegacyStartOffer());
       case 'viewer-joined':
         final id = msg['viewerId'] as String?;
         if (id != null) unawaited(_onViewerJoined(id));
@@ -198,29 +243,33 @@ class WebRTCStreamService extends ChangeNotifier {
   }
 
   Future<void> _handleAnswer(Map<String, dynamic> msg) async {
-    final viewerId = msg['viewerId'] as String?;
-    if (viewerId == null) return;
-    final pc = _viewerPeers[viewerId];
-    if (pc == null) return;
-
     final answer = RTCSessionDescription(
       msg['sdp'] as String,
       msg['sdpType'] as String? ?? 'answer',
     );
+    final viewerId = msg['viewerId'] as String?;
+    if (viewerId == null || viewerId == 'legacy') {
+      await _legacyPeer?.setRemoteDescription(answer);
+      return;
+    }
+    final pc = _viewerPeers[viewerId];
+    if (pc == null) return;
     await pc.setRemoteDescription(answer);
   }
 
   Future<void> _handleIce(Map<String, dynamic> msg) async {
-    final viewerId = msg['viewerId'] as String?;
-    if (viewerId == null) return;
-    final pc = _viewerPeers[viewerId];
-    if (pc == null) return;
-
     final candidate = RTCIceCandidate(
       msg['candidate'] as String?,
       msg['sdpMid'] as String?,
       msg['sdpMLineIndex'] as int?,
     );
+    final viewerId = msg['viewerId'] as String?;
+    if (viewerId == null) {
+      await _legacyPeer?.addCandidate(candidate);
+      return;
+    }
+    final pc = _viewerPeers[viewerId];
+    if (pc == null) return;
     await pc.addCandidate(candidate);
   }
 
@@ -345,6 +394,11 @@ class WebRTCStreamService extends ChangeNotifier {
     }
 
     try {
+      await _legacyPeer?.close();
+    } catch (_) {}
+    _legacyPeer = null;
+
+    try {
       await _localStream?.dispose();
     } catch (_) {}
     _localStream = null;
@@ -353,6 +407,7 @@ class WebRTCStreamService extends ChangeNotifier {
     } catch (_) {}
 
     _iceServers = null;
+    _pendingViewers.clear();
     unawaited(DashcamService.instance.initialize());
   }
 }

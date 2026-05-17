@@ -85,6 +85,10 @@ function viewerCount(room) {
 function notifyPublisherCount(room) {
   if (room.publisher) {
     send(room.publisher, { type: 'viewer-count', count: viewerCount(room) });
+    // Legacy apps expect start-offer when a viewer connects.
+    if (viewerCount(room) > 0) {
+      send(room.publisher, { type: 'start-offer' });
+    }
   }
 }
 
@@ -209,7 +213,11 @@ wss.on('connection', (ws) => {
 
     if (msg.type === 'offer') {
       const viewerId = msg.viewerId;
-      if (!viewerId) return;
+      if (!viewerId) {
+        // Legacy publisher: one offer → all viewers in the room.
+        room.viewers.forEach((viewerWs) => send(viewerWs, msg));
+        return;
+      }
       const viewer = room.viewers.get(viewerId);
       if (viewer) send(viewer, msg);
     } else if (msg.type === 'answer') {
@@ -220,7 +228,10 @@ wss.on('connection', (ws) => {
     } else if (msg.type === 'ice') {
       if (ws.role === 'publisher') {
         const viewerId = msg.viewerId;
-        if (!viewerId) return;
+        if (!viewerId) {
+          room.viewers.forEach((viewerWs) => send(viewerWs, msg));
+          return;
+        }
         const viewer = room.viewers.get(viewerId);
         if (viewer) send(viewer, msg);
       } else if (ws.role === 'viewer' && room.publisher) {
