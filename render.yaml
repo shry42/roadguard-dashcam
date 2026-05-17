@@ -1,0 +1,13 @@
+# One-time deploy → permanent URL like https://roadguard-signaling.onrender.com
+# Dashboard: https://dashboard.render.com → New → Blueprint → connect this repo
+services:
+  - type: web
+    name: roadguard-signaling
+    runtime: node
+    plan: free
+    buildCommand: cd server && npm install && cp -r ../web_admin ./web_admin
+    startCommand: cd server && node signaling-server.js
+    healthCheckPath: /api/stream-config?room=dashcam-1
+    envVars:
+      - key: NODE_ENV
+        value: production

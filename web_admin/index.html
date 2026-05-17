@@ -1,0 +1,293 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>RoadGuard Admin — Live View</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: 'Segoe UI', system-ui, sans-serif;
+      background: #0a0e14;
+      color: #f1f5f9;
+      min-height: 100vh;
+    }
+    header {
+      padding: 16px 24px;
+      border-bottom: 1px solid #2a3544;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 12px;
+    }
+    h1 { font-size: 1.25rem; font-weight: 700; }
+    h1 span { color: #00c9a7; }
+    .badge {
+      padding: 4px 10px;
+      border-radius: 20px;
+      font-size: 12px;
+      font-weight: 600;
+    }
+    .badge.live { background: #22c55e22; color: #22c55e; border: 1px solid #22c55e55; }
+    .badge.off { background: #64748b22; color: #94a3b8; border: 1px solid #64748b55; }
+    main { padding: 24px; max-width: 1200px; margin: 0 auto; }
+    .panel {
+      background: #141b26;
+      border: 1px solid #2a3544;
+      border-radius: 16px;
+      padding: 20px;
+      margin-bottom: 20px;
+    }
+    .row { display: flex; flex-wrap: wrap; gap: 12px; align-items: flex-end; }
+    label { display: block; font-size: 12px; color: #94a3b8; margin-bottom: 6px; }
+    input {
+      background: #1e2836;
+      border: 1px solid #2a3544;
+      color: #f1f5f9;
+      padding: 10px 14px;
+      border-radius: 10px;
+      font-size: 14px;
+      min-width: 200px;
+    }
+    button {
+      background: linear-gradient(135deg, #00c9a7, #3b82f6);
+      color: #0a0e14;
+      border: none;
+      padding: 11px 20px;
+      border-radius: 10px;
+      font-weight: 600;
+      cursor: pointer;
+      font-size: 14px;
+    }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    button.secondary {
+      background: #1e2836;
+      color: #f1f5f9;
+      border: 1px solid #2a3544;
+    }
+    #videoWrap {
+      position: relative;
+      background: #000;
+      border-radius: 12px;
+      overflow: hidden;
+      aspect-ratio: 16/9;
+      max-height: 70vh;
+    }
+    video { width: 100%; height: 100%; object-fit: contain; display: block; }
+    .placeholder {
+      position: absolute;
+      inset: 0;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      color: #64748b;
+      gap: 8px;
+    }
+    .log {
+      font-family: ui-monospace, monospace;
+      font-size: 12px;
+      color: #94a3b8;
+      max-height: 120px;
+      overflow-y: auto;
+      margin-top: 12px;
+      line-height: 1.6;
+    }
+    .stats {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+      gap: 12px;
+      margin-top: 16px;
+    }
+    .stat {
+      background: #1a2332;
+      border-radius: 12px;
+      padding: 14px;
+      border: 1px solid #2a3544;
+    }
+    .stat b { display: block; font-size: 1.1rem; color: #00c9a7; margin-bottom: 4px; }
+    .stat small { color: #64748b; font-size: 11px; }
+    code { background: #1e2836; padding: 2px 6px; border-radius: 4px; font-size: 12px; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Road<span>Guard</span> Admin</h1>
+    <span id="statusBadge" class="badge off">OFFLINE</span>
+  </header>
+  <main>
+    <div class="panel">
+      <div class="row">
+        <div>
+          <label>Signaling server (WebSocket)</label>
+          <input id="wsUrl" type="text" placeholder="ws://192.168.1.5:8080" />
+        </div>
+        <div>
+          <label>Room ID</label>
+          <input id="roomId" type="text" value="dashcam-1" />
+        </div>
+        <button id="connectBtn">Connect & Watch</button>
+        <button id="disconnectBtn" class="secondary" disabled>Disconnect</button>
+      </div>
+      <p style="margin-top:12px;font-size:13px;color:#64748b">
+        Start <code>npm start</code> in the <code>server/</code> folder, then tap <strong>Stream</strong> on the phone app.
+      </p>
+    </div>
+
+    <div class="panel">
+      <div id="videoWrap">
+        <video id="remoteVideo" autoplay playsinline></video>
+        <div id="placeholder" class="placeholder">
+          <svg width="48" height="48" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24"><path d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z"/></svg>
+          <span>Waiting for dashcam stream…</span>
+        </div>
+      </div>
+      <div class="stats">
+        <div class="stat"><b id="statRoom">—</b><small>Room</small></div>
+        <div class="stat"><b id="statIce">—</b><small>ICE state</small></div>
+        <div class="stat"><b id="statConn">—</b><small>Connection</small></div>
+      </div>
+      <div id="log" class="log"></div>
+    </div>
+  </main>
+
+  <script>
+    const wsUrlInput = document.getElementById('wsUrl');
+    const roomIdInput = document.getElementById('roomId');
+    const connectBtn = document.getElementById('connectBtn');
+    const disconnectBtn = document.getElementById('disconnectBtn');
+    const remoteVideo = document.getElementById('remoteVideo');
+    const placeholder = document.getElementById('placeholder');
+    const statusBadge = document.getElementById('statusBadge');
+    const logEl = document.getElementById('log');
+    const statRoom = document.getElementById('statRoom');
+    const statIce = document.getElementById('statIce');
+    const statConn = document.getElementById('statConn');
+
+    const params = new URLSearchParams(location.search);
+    const defaultRoom = params.get('room') || 'dashcam-1';
+    roomIdInput.value = defaultRoom;
+
+    let ws, pc, iceServers = [{ urls: 'stun:stun.l.google.com:19302' }];
+
+    async function loadStreamConfig() {
+      const room = roomIdInput.value.trim() || defaultRoom;
+      const configUrl = `${location.origin}/api/stream-config?room=${encodeURIComponent(room)}`;
+      try {
+        const res = await fetch(configUrl);
+        const cfg = await res.json();
+        if (cfg.signalingUrl) wsUrlInput.value = cfg.signalingUrl;
+        if (cfg.iceServers?.length) iceServers = cfg.iceServers;
+        log('Loaded config from API');
+        return cfg;
+      } catch (e) {
+        const host = location.hostname || 'localhost';
+        wsUrlInput.value = location.protocol === 'file:'
+          ? 'ws://localhost:8080'
+          : `ws://${host}:${location.port || '8080'}`;
+        log('Using defaults (API not reachable)');
+        return null;
+      }
+    }
+
+    loadStreamConfig();
+
+    function log(msg) {
+      const line = document.createElement('div');
+      line.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
+      logEl.prepend(line);
+    }
+
+    function setLive(live) {
+      statusBadge.textContent = live ? 'LIVE' : 'OFFLINE';
+      statusBadge.className = 'badge ' + (live ? 'live' : 'off');
+    }
+
+    async function connect() {
+      disconnect();
+      const url = wsUrlInput.value.trim();
+      const room = roomIdInput.value.trim() || 'dashcam-1';
+      statRoom.textContent = room;
+
+      await loadStreamConfig();
+      pc = new RTCPeerConnection({ iceServers });
+
+      pc.ontrack = (e) => {
+        remoteVideo.srcObject = e.streams[0];
+        placeholder.style.display = 'none';
+        setLive(true);
+        log('Receiving video track');
+      };
+
+      pc.onicecandidate = (e) => {
+        if (e.candidate && ws?.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({
+            type: 'ice',
+            candidate: e.candidate.candidate,
+            sdpMid: e.candidate.sdpMid,
+            sdpMLineIndex: e.candidate.sdpMLineIndex,
+          }));
+        }
+      };
+
+      pc.oniceconnectionstatechange = () => {
+        statIce.textContent = pc.iceConnectionState;
+        statConn.textContent = pc.connectionState;
+        if (pc.iceConnectionState === 'disconnected' || pc.iceConnectionState === 'failed') {
+          setLive(false);
+        }
+      };
+
+      ws = new WebSocket(url);
+      ws.onopen = () => {
+        log('Connected to signaling');
+        ws.send(JSON.stringify({ type: 'join', room, role: 'viewer' }));
+        connectBtn.disabled = true;
+        disconnectBtn.disabled = false;
+      };
+
+      ws.onmessage = async (ev) => {
+        const msg = JSON.parse(ev.data);
+        if (msg.type === 'offer') {
+          log('Got offer from phone');
+          await pc.setRemoteDescription({ type: 'offer', sdp: msg.sdp });
+          const answer = await pc.createAnswer();
+          await pc.setLocalDescription(answer);
+          ws.send(JSON.stringify({ type: 'answer', sdp: answer.sdp, sdpType: answer.type }));
+          log('Sent answer');
+        } else if (msg.type === 'ice' && msg.candidate) {
+          await pc.addIceCandidate({
+            candidate: msg.candidate,
+            sdpMid: msg.sdpMid,
+            sdpMLineIndex: msg.sdpMLineIndex,
+          });
+        }
+      };
+
+      ws.onerror = () => log('WebSocket error');
+      ws.onclose = () => {
+        log('WebSocket closed');
+        setLive(false);
+        connectBtn.disabled = false;
+        disconnectBtn.disabled = true;
+      };
+    }
+
+    function disconnect() {
+      setLive(false);
+      placeholder.style.display = 'flex';
+      remoteVideo.srcObject = null;
+      if (ws) { ws.close(); ws = null; }
+      if (pc) { pc.close(); pc = null; }
+      connectBtn.disabled = false;
+      disconnectBtn.disabled = true;
+      statIce.textContent = '—';
+      statConn.textContent = '—';
+    }
+
+    connectBtn.onclick = connect;
+    disconnectBtn.onclick = disconnect;
+  </script>
+</body>
+</html>
