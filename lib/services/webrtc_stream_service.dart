@@ -24,6 +24,7 @@ class WebRTCStreamService extends ChangeNotifier {
   final Map<String, RTCPeerConnection> _viewerPeers = {};
   /// Fallback for older signaling servers that use [start-offer] instead of [viewer-joined].
   RTCPeerConnection? _legacyPeer;
+  bool _useLegacySignaling = true;
   final RTCVideoRenderer localRenderer = RTCVideoRenderer();
   WebSocketChannel? _channel;
   bool _rendererReady = false;
@@ -147,6 +148,9 @@ class WebRTCStreamService extends ChangeNotifier {
   }
 
   Future<void> _onViewerJoined(String viewerId) async {
+    _useLegacySignaling = false;
+    await _closeLegacyPeer();
+
     if (_localStream == null || !isLive) {
       _pendingViewers.add(viewerId);
       debugPrint('Queued viewer $viewerId (stream not live yet)');
@@ -162,6 +166,14 @@ class WebRTCStreamService extends ChangeNotifier {
       debugPrint('viewer-joined failed for $viewerId: $e');
       await _closeViewer(viewerId);
     }
+  }
+
+  Future<void> _closeLegacyPeer() async {
+    if (_legacyPeer == null) return;
+    try {
+      await _legacyPeer!.close();
+    } catch (_) {}
+    _legacyPeer = null;
   }
 
   Future<void> _flushPendingViewers() async {
@@ -193,6 +205,7 @@ class WebRTCStreamService extends ChangeNotifier {
   }
 
   Future<void> _onLegacyStartOffer() async {
+    if (!_useLegacySignaling) return;
     if (!isLive || _localStream == null) return;
     if (_viewerPeers.isNotEmpty) return;
 
@@ -224,7 +237,7 @@ class WebRTCStreamService extends ChangeNotifier {
         notifyListeners();
       case 'start-offer':
         unawaited(_flushPendingViewers());
-        unawaited(_onLegacyStartOffer());
+        if (_useLegacySignaling) unawaited(_onLegacyStartOffer());
       case 'viewer-joined':
         final id = msg['viewerId'] as String?;
         if (id != null) unawaited(_onViewerJoined(id));
@@ -242,19 +255,48 @@ class WebRTCStreamService extends ChangeNotifier {
     }
   }
 
+  RTCPeerConnection? _peerForAnswer(String? viewerId) {
+    if (viewerId != null && viewerId != 'legacy') {
+      return _viewerPeers[viewerId];
+    }
+    if (_useLegacySignaling && _legacyPeer != null) {
+      return _legacyPeer;
+    }
+    if (_viewerPeers.length == 1) {
+      return _viewerPeers.values.first;
+    }
+    return null;
+  }
+
+  RTCPeerConnection? _peerForIce(String? viewerId) {
+    if (viewerId != null && viewerId != 'legacy') {
+      return _viewerPeers[viewerId];
+    }
+    if (_useLegacySignaling && _legacyPeer != null) {
+      return _legacyPeer;
+    }
+    return null;
+  }
+
   Future<void> _handleAnswer(Map<String, dynamic> msg) async {
     final answer = RTCSessionDescription(
       msg['sdp'] as String,
       msg['sdpType'] as String? ?? 'answer',
     );
-    final viewerId = msg['viewerId'] as String?;
-    if (viewerId == null || viewerId == 'legacy') {
-      await _legacyPeer?.setRemoteDescription(answer);
+    final pc = _peerForAnswer(msg['viewerId'] as String?);
+    if (pc == null) {
+      debugPrint('Ignoring answer — no peer for viewer ${msg['viewerId']}');
       return;
     }
-    final pc = _viewerPeers[viewerId];
-    if (pc == null) return;
-    await pc.setRemoteDescription(answer);
+    if (pc.signalingState != RTCSignalingState.RTCSignalingStateHaveLocalOffer) {
+      debugPrint('Ignoring duplicate answer (state=${pc.signalingState})');
+      return;
+    }
+    try {
+      await pc.setRemoteDescription(answer);
+    } catch (e) {
+      debugPrint('setRemoteDescription failed: $e');
+    }
   }
 
   Future<void> _handleIce(Map<String, dynamic> msg) async {
@@ -263,14 +305,13 @@ class WebRTCStreamService extends ChangeNotifier {
       msg['sdpMid'] as String?,
       msg['sdpMLineIndex'] as int?,
     );
-    final viewerId = msg['viewerId'] as String?;
-    if (viewerId == null) {
-      await _legacyPeer?.addCandidate(candidate);
-      return;
-    }
-    final pc = _viewerPeers[viewerId];
+    final pc = _peerForIce(msg['viewerId'] as String?);
     if (pc == null) return;
-    await pc.addCandidate(candidate);
+    try {
+      await pc.addCandidate(candidate);
+    } catch (e) {
+      debugPrint('addCandidate failed: $e');
+    }
   }
 
   void _send(Map<String, dynamic> data) {
@@ -393,10 +434,8 @@ class WebRTCStreamService extends ChangeNotifier {
       await _closeViewer(id);
     }
 
-    try {
-      await _legacyPeer?.close();
-    } catch (_) {}
-    _legacyPeer = null;
+    await _closeLegacyPeer();
+    _useLegacySignaling = true;
 
     try {
       await _localStream?.dispose();

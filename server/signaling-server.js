@@ -85,10 +85,6 @@ function viewerCount(room) {
 function notifyPublisherCount(room) {
   if (room.publisher) {
     send(room.publisher, { type: 'viewer-count', count: viewerCount(room) });
-    // Legacy apps expect start-offer when a viewer connects.
-    if (viewerCount(room) > 0) {
-      send(room.publisher, { type: 'start-offer' });
-    }
   }
 }
 
