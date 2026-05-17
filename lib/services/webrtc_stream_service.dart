@@ -32,6 +32,12 @@ class WebRTCStreamService extends ChangeNotifier {
   bool _switchInFlight = false;
   List<Map<String, dynamic>>? _iceServers;
   final Set<String> _pendingViewers = {};
+  final List<String> _viewerJoinQueue = [];
+  bool _processingViewerQueue = false;
+  final Map<String, List<RTCIceCandidate>> _pendingRemoteIce = {};
+
+  /// Android struggles beyond ~2 HW-encoded outgoing streams; prefer one browser tab per device.
+  static const int maxPublisherPeers = 2;
 
   bool get isLive => streamState == StreamState.live;
   bool get isConnecting => streamState == StreamState.connecting;
@@ -99,8 +105,10 @@ class WebRTCStreamService extends ChangeNotifier {
       'audio': true,
       'video': {
         'facingMode': _useFrontCamera ? 'user' : 'environment',
-        'width': 1280,
-        'height': 720,
+        // 720p max keeps multi-viewer encoding stable on mid-range Android phones.
+        'width': 960,
+        'height': 540,
+        'frameRate': 24,
       },
     };
     _localStream = await navigator.mediaDevices.getUserMedia(mediaConstraints);
@@ -156,15 +164,96 @@ class WebRTCStreamService extends ChangeNotifier {
       debugPrint('Queued viewer $viewerId (stream not live yet)');
       return;
     }
-    if (_viewerPeers.containsKey(viewerId)) return;
+    _enqueueViewerJoin(viewerId);
+  }
+
+  void _enqueueViewerJoin(String viewerId) {
+    if (_viewerPeers.containsKey(viewerId) ||
+        _viewerJoinQueue.contains(viewerId) ||
+        _pendingViewers.contains(viewerId)) {
+      return;
+    }
+    _viewerJoinQueue.add(viewerId);
+    unawaited(_processViewerJoinQueue());
+  }
+
+  Future<void> _processViewerJoinQueue() async {
+    if (_processingViewerQueue) return;
+    _processingViewerQueue = true;
 
     try {
-      final pc = await _createPeerConnectionForViewer(viewerId);
-      _viewerPeers[viewerId] = pc;
-      await _sendOfferToViewer(viewerId, pc);
-    } catch (e) {
-      debugPrint('viewer-joined failed for $viewerId: $e');
-      await _closeViewer(viewerId);
+      while (_viewerJoinQueue.isNotEmpty && isLive) {
+        if (_viewerPeers.length >= maxPublisherPeers) {
+          debugPrint(
+            'Phone supports up to $maxPublisherPeers viewers; '
+            'ignoring extra connections',
+          );
+          _viewerJoinQueue.clear();
+          break;
+        }
+
+        final viewerId = _viewerJoinQueue.removeAt(0);
+        if (_viewerPeers.containsKey(viewerId)) continue;
+
+        try {
+          await _connectViewer(viewerId);
+        } catch (e) {
+          debugPrint('viewer-joined failed for $viewerId: $e');
+          await _closeViewer(viewerId);
+        }
+
+        // Let the encoder settle before opening the next peer connection.
+        if (_viewerJoinQueue.isNotEmpty) {
+          await Future<void>.delayed(const Duration(milliseconds: 2000));
+        }
+      }
+    } finally {
+      _processingViewerQueue = false;
+      if (_viewerJoinQueue.isNotEmpty && isLive) {
+        unawaited(_processViewerJoinQueue());
+      }
+    }
+  }
+
+  Future<void> _connectViewer(String viewerId) async {
+    final pc = await _createPeerConnectionForViewer(viewerId);
+    _viewerPeers[viewerId] = pc;
+    await _sendOfferToViewer(viewerId, pc);
+    await _waitForPeerConnected(pc, viewerId);
+  }
+
+  Future<void> _waitForPeerConnected(
+    RTCPeerConnection pc,
+    String viewerId, {
+    Duration timeout = const Duration(seconds: 15),
+  }) async {
+    final state = pc.iceConnectionState;
+    if (state == RTCIceConnectionState.RTCIceConnectionStateConnected ||
+        state == RTCIceConnectionState.RTCIceConnectionStateCompleted) {
+      return;
+    }
+
+    final completer = Completer<void>();
+    late void Function(RTCIceConnectionState) handler;
+    handler = (RTCIceConnectionState iceState) {
+      debugPrint('viewer $viewerId ice: $iceState');
+      if (iceState == RTCIceConnectionState.RTCIceConnectionStateConnected ||
+          iceState == RTCIceConnectionState.RTCIceConnectionStateCompleted) {
+        if (!completer.isCompleted) completer.complete();
+      } else if (iceState == RTCIceConnectionState.RTCIceConnectionStateFailed ||
+          iceState == RTCIceConnectionState.RTCIceConnectionStateClosed) {
+        if (!completer.isCompleted) {
+          completer.completeError('ICE failed for $viewerId');
+        }
+      }
+    };
+
+    pc.onIceConnectionState = handler;
+
+    try {
+      await completer.future.timeout(timeout);
+    } on TimeoutException {
+      debugPrint('Timed out waiting for $viewerId to connect');
     }
   }
 
@@ -181,7 +270,7 @@ class WebRTCStreamService extends ChangeNotifier {
     final ids = _pendingViewers.toList();
     _pendingViewers.clear();
     for (final id in ids) {
-      await _onViewerJoined(id);
+      _enqueueViewerJoin(id);
     }
   }
 
@@ -221,11 +310,24 @@ class WebRTCStreamService extends ChangeNotifier {
   }
 
   Future<void> _closeViewer(String viewerId) async {
+    _pendingRemoteIce.remove(viewerId);
     final pc = _viewerPeers.remove(viewerId);
     if (pc != null) {
       try {
         await pc.close();
       } catch (_) {}
+    }
+  }
+
+  Future<void> _flushPendingIce(String viewerId, RTCPeerConnection pc) async {
+    final pending = _pendingRemoteIce.remove(viewerId);
+    if (pending == null) return;
+    for (final candidate in pending) {
+      try {
+        await pc.addCandidate(candidate);
+      } catch (e) {
+        debugPrint('Buffered ICE failed for $viewerId: $e');
+      }
     }
   }
 
@@ -294,19 +396,33 @@ class WebRTCStreamService extends ChangeNotifier {
     }
     try {
       await pc.setRemoteDescription(answer);
+      final viewerId = msg['viewerId'] as String?;
+      if (viewerId != null) {
+        await _flushPendingIce(viewerId, pc);
+      }
     } catch (e) {
       debugPrint('setRemoteDescription failed: $e');
     }
   }
 
   Future<void> _handleIce(Map<String, dynamic> msg) async {
+    final viewerId = msg['viewerId'] as String?;
     final candidate = RTCIceCandidate(
       msg['candidate'] as String?,
       msg['sdpMid'] as String?,
       msg['sdpMLineIndex'] as int?,
     );
-    final pc = _peerForIce(msg['viewerId'] as String?);
+    final pc = _peerForIce(viewerId);
     if (pc == null) return;
+
+    final remote = await pc.getRemoteDescription();
+    if (remote == null) {
+      if (viewerId != null) {
+        _pendingRemoteIce.putIfAbsent(viewerId, () => []).add(candidate);
+      }
+      return;
+    }
+
     try {
       await pc.addCandidate(candidate);
     } catch (e) {
@@ -376,8 +492,9 @@ class WebRTCStreamService extends ChangeNotifier {
       'audio': false,
       'video': {
         'facingMode': front ? 'user' : 'environment',
-        'width': 1280,
-        'height': 720,
+        'width': 960,
+        'height': 540,
+        'frameRate': 24,
       },
     });
 
@@ -447,6 +564,9 @@ class WebRTCStreamService extends ChangeNotifier {
 
     _iceServers = null;
     _pendingViewers.clear();
+    _viewerJoinQueue.clear();
+    _processingViewerQueue = false;
+    _pendingRemoteIce.clear();
     unawaited(DashcamService.instance.initialize());
   }
 }

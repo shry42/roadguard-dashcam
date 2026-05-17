@@ -171,7 +171,68 @@
 
     let ws, pc, myViewerId = null;
     let pendingOffer = null;
+    const pendingRemoteIce = [];
+    const pendingLocalIce = [];
     let iceServers = [{ urls: 'stun:stun.l.google.com:19302' }];
+
+    function watchLockKey(room) {
+      return 'roadguard-watch-' + room;
+    }
+
+  function takeWatchLock(room) {
+    const key = watchLockKey(room);
+    const tabId = sessionStorage.getItem('roadguardTabId') || crypto.randomUUID();
+    sessionStorage.setItem('roadguardTabId', tabId);
+    const raw = localStorage.getItem(key);
+    if (raw) {
+      try {
+        const lock = JSON.parse(raw);
+        if (lock.tabId !== tabId && Date.now() - lock.ts < 15000) {
+          return false;
+        }
+      } catch (_) {}
+    }
+    localStorage.setItem(key, JSON.stringify({ tabId, ts: Date.now() }));
+    return true;
+  }
+
+  function releaseWatchLock(room) {
+    const key = watchLockKey(room);
+    const tabId = sessionStorage.getItem('roadguardTabId');
+    const raw = localStorage.getItem(key);
+    if (!raw || !tabId) return;
+    try {
+      const lock = JSON.parse(raw);
+      if (lock.tabId === tabId) localStorage.removeItem(key);
+    } catch (_) {}
+  }
+
+  function flushPendingLocalIce() {
+    if (!ws || ws.readyState !== WebSocket.OPEN || !myViewerId) return;
+    while (pendingLocalIce.length) {
+      const c = pendingLocalIce.shift();
+      const iceMsg = {
+        type: 'ice',
+        candidate: c.candidate,
+        sdpMid: c.sdpMid,
+        sdpMLineIndex: c.sdpMLineIndex,
+      };
+      if (myViewerId !== 'legacy') iceMsg.viewerId = myViewerId;
+      ws.send(JSON.stringify(iceMsg));
+    }
+  }
+
+  async function flushPendingRemoteIce() {
+    if (!pc || !pc.remoteDescription) return;
+    while (pendingRemoteIce.length) {
+      const c = pendingRemoteIce.shift();
+      try {
+        await pc.addIceCandidate(c);
+      } catch (e) {
+        log('ICE error: ' + e);
+      }
+    }
+  }
 
     async function loadStreamConfig() {
       const room = roomIdInput.value.trim() || defaultRoom;
@@ -212,6 +273,15 @@
       const room = roomIdInput.value.trim() || 'dashcam-1';
       statRoom.textContent = room;
 
+      if (!takeWatchLock(room)) {
+        log(
+          'Another tab on this computer is already watching. ' +
+          'Close the other tab, wait a few seconds, then Connect again. ' +
+          '(Same Wi‑Fi is fine — use a second phone/laptop for a second screen.)'
+        );
+        return;
+      }
+
       await loadStreamConfig();
       pc = new RTCPeerConnection({ iceServers });
 
@@ -223,15 +293,18 @@
       };
 
       pc.onicecandidate = (e) => {
-        if (e.candidate && ws?.readyState === WebSocket.OPEN && myViewerId) {
-          const iceMsg = {
-            type: 'ice',
-            candidate: e.candidate.candidate,
-            sdpMid: e.candidate.sdpMid,
-            sdpMLineIndex: e.candidate.sdpMLineIndex,
-          };
+        if (!e.candidate) return;
+        const payload = {
+          candidate: e.candidate.candidate,
+          sdpMid: e.candidate.sdpMid,
+          sdpMLineIndex: e.candidate.sdpMLineIndex,
+        };
+        if (ws?.readyState === WebSocket.OPEN && myViewerId) {
+          const iceMsg = { type: 'ice', ...payload };
           if (myViewerId !== 'legacy') iceMsg.viewerId = myViewerId;
           ws.send(JSON.stringify(iceMsg));
+        } else {
+          pendingLocalIce.push(payload);
         }
       };
 
@@ -270,6 +343,8 @@
           if (myViewerId && myViewerId !== 'legacy') answerMsg.viewerId = myViewerId;
           ws.send(JSON.stringify(answerMsg));
           log('Sent answer');
+          flushPendingLocalIce();
+          await flushPendingRemoteIce();
         } catch (e) {
           log('Offer failed: ' + e);
           if (isRenegotiation && remoteVideo.srcObject) {
@@ -290,6 +365,7 @@
             myViewerId = 'legacy';
             log('Joined room (legacy mode — redeploy Render for multi-viewer)');
           }
+          flushPendingLocalIce();
           if (pendingOffer) {
             const offer = pendingOffer;
             pendingOffer = null;
@@ -301,6 +377,10 @@
           log(msg.message || 'Signaling error');
           return;
         }
+        if (msg.type === 'info') {
+          log(msg.message || '');
+          return;
+        }
         if (msg.type === 'offer') {
           if (!myViewerId) {
             pendingOffer = msg;
@@ -310,12 +390,17 @@
           await handleOffer(msg);
         } else if (msg.type === 'ice' && msg.candidate) {
           if (msg.viewerId && myViewerId && myViewerId !== 'legacy' && msg.viewerId !== myViewerId) return;
+          const ice = {
+            candidate: msg.candidate,
+            sdpMid: msg.sdpMid,
+            sdpMLineIndex: msg.sdpMLineIndex,
+          };
+          if (!pc.remoteDescription) {
+            pendingRemoteIce.push(ice);
+            return;
+          }
           try {
-            await pc.addIceCandidate({
-              candidate: msg.candidate,
-              sdpMid: msg.sdpMid,
-              sdpMLineIndex: msg.sdpMLineIndex,
-            });
+            await pc.addIceCandidate(ice);
           } catch (e) {
             log('ICE error: ' + e);
           }
@@ -332,11 +417,15 @@
     }
 
     function disconnect() {
+      const room = roomIdInput.value.trim() || defaultRoom;
+      releaseWatchLock(room);
       setLive(false);
       placeholder.style.display = 'flex';
       remoteVideo.srcObject = null;
       myViewerId = null;
       pendingOffer = null;
+      pendingRemoteIce.length = 0;
+      pendingLocalIce.length = 0;
       if (ws) { ws.close(); ws = null; }
       if (pc) { pc.close(); pc = null; }
       connectBtn.disabled = false;

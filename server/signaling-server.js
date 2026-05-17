@@ -199,6 +199,11 @@ wss.on('connection', (ws) => {
         if (room.publisher) {
           send(room.publisher, { type: 'viewer-joined', viewerId });
           notifyPublisherCount(room);
+        } else {
+          send(ws, {
+            type: 'info',
+            message: 'Connected. Waiting for dashcam to start streaming…',
+          });
         }
       }
       return;
